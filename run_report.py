@@ -1,59 +1,100 @@
+import streamlit as st
 import pandas as pd
-import os
-import glob
+import io
+import xlsxwriter
 
-# 1. איתור הקובץ - הסקריפט יחפש כל קובץ CSV בתיקייה
-csv_files = glob.glob("*.csv")
-if not csv_files:
-    print("לא נמצא קובץ CSV בתיקייה. וודא שקובץ ה-QuickBooks נמצא באותה תיקייה של הסקריפט.")
-    input("לחץ על Enter ליציאה...")
-    exit()
+# הגדרת כותרת האתר
+st.set_page_config(page_title="Finance Tool", layout="centered")
 
-file_name = csv_files[0] # לוקח את הקובץ הראשון שנמצא
-print(f"מעבד את הקובץ: {file_name}")
+st.title("📊 מחולל דוחות כספיים")
+st.write("העלה את 3 הקבצים (LTD, INC וקובץ ה-Budget) כדי לייצר את הדוח.")
 
-# 2. קריאה ועיבוד
-df = pd.read_csv(file_name, skiprows=4)
-df = df.dropna(subset=['Transaction date'])
-df['Amount'] = df['Amount'].astype(str).str.replace(',', '').str.replace('"', '').astype(float)
-df['Name'] = df['Name'].fillna('Unknown')
-df['Memo/Description'] = df['Memo/Description'].fillna('-')
-df['Distribution account'] = df['Distribution account'].fillna('Uncategorized')
+def fix_date_swap(date_val):
+    if pd.isna(date_val): return date_val
+    d = pd.to_datetime(date_val, errors='coerce')
+    if pd.isna(d): return date_val
+    if d.month > 2:
+        try: return pd.Timestamp(year=d.year, month=d.day, day=d.month)
+        except: return d
+    return d
 
-# 3. סינון כרטיסים תוצאתיים בלבד
-balance_sheet_terms = ['Checking', 'Mesh', 'Morgan Stanley', 'Savings', 'Money Market', 'Investments', 'Intercompany', 'Payable', 'Receivable', 'Accrued', 'Prepaid', 'Stripe', 'Balance', 'Cash', 'Credit Card']
-mask = df['Distribution account'].str.contains('|'.join(balance_sheet_terms), na=False, case=False)
-df_result = df[~mask].copy()
-df_result = df_result[['Transaction date', 'Name', 'Distribution account', 'Amount', 'Transaction type', 'Memo/Description']]
-df_result = df_result.sort_values(by=['Distribution account', 'Transaction date'])
+# כפתור העלאת קבצים
+uploaded_files = st.file_uploader("בחר קבצים...", accept_multiple_files=True)
 
-# 4. יצירת האקסל החכם
-output_file = 'QB_Smart_Report_Automated.xlsx'
-with pd.ExcelWriter(output_file, engine='xlsxwriter') as writer:
-    df_result.to_excel(writer, sheet_name='Data', index=False)
-    workbook = writer.book
-    filter_sheet = workbook.add_worksheet('כלי סינון חכם')
-    
-    # עיצובים
-    header_fmt = workbook.add_format({'bold': True, 'bg_color': '#D7E4BC', 'border': 1, 'align': 'center'})
-    
-    # ממשק סינון
-    filter_sheet.write('A1', 'בחר חשבון:', header_fmt)
-    unique_accs = sorted(df_result['Distribution account'].unique())
-    list_sheet = workbook.add_worksheet('AccList')
-    for i, acc in enumerate(unique_accs):
-        list_sheet.write(i, 0, acc)
-    
-    filter_sheet.data_validation('B1', {'validate': 'list', 'source': f'=AccList!$A$1:$A${len(unique_accs)}'})
-    if unique_accs: filter_sheet.write('B1', unique_accs[0])
-    
-    headers = ['תאריך', 'ספק', 'חשבון', 'סכום', 'סוג', 'תיאור (Memo)']
-    for col, h in enumerate(headers):
-        filter_sheet.write(3, col, h, header_fmt)
-        filter_sheet.set_column(col, col, 18)
+if uploaded_files:
+    if len(uploaded_files) < 3:
+        st.info("ממתין להעלאת כל 3 הקבצים...")
+    else:
+        if st.button("🚀 ייצר דוח אקסל"):
+            try:
+                all_data = []
+                df_mapping = None
+                
+                # איתור המיפוי
+                for f in uploaded_files:
+                    if "budget" in f.name.lower():
+                        df_mapping = pd.read_excel(f, skiprows=2)
+                        df_mapping.columns = [c.strip() for c in df_mapping.columns]
+                        df_mapping['Entity'] = df_mapping['Entity'].str.strip().str.capitalize()
+                        df_mapping['Number of account-ERP'] = df_mapping['Number of account-ERP'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+                        df_mapping = df_mapping[['Entity', 'Number of account-ERP', 'Budget item']].dropna()
 
-    last_row = len(df_result) + 1
-    formula = f'=FILTER(Data!A2:F{last_row}, Data!C2:C{last_row} = B1, "אין נתונים")'
-    filter_sheet.write_dynamic_array_formula('A5:F5', formula)
+                # עיבוד הנתונים
+                for f in uploaded_files:
+                    if "budget" in f.name.lower(): continue
+                    
+                    if f.name.lower().endswith('.csv'):
+                        try: content = f.read().decode('utf-8')
+                        except: content = f.read().decode('cp1255')
+                        df_raw = pd.read_csv(io.StringIO(content))
+                    else:
+                        df_raw = pd.read_excel(f)
 
-print(f"הצלחתי! הקובץ {output_file} נוצר בתיקייה.")
+                    is_ltd = "תאריך למאזן" in df_raw.columns or any("תאריך" in str(c) for c in df_raw.columns)
+                    
+                    if is_ltd:
+                        date_col = [c for c in df_raw.columns if "תאריך" in str(c)][0]
+                        acc_num = df_raw['חשבון'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+                        df_temp = pd.DataFrame({
+                            'Entity': 'Ltd',
+                            'Date': pd.to_datetime(df_raw[date_col], dayfirst=True, errors='coerce'),
+                            'Vendor': df_raw['תאור חשבון נגדי'].fillna('Unknown'),
+                            'Account': (acc_num + " - " + df_raw['תאור'].fillna('').astype(str)).str.strip(),
+                            'Amount': pd.to_numeric(df_raw['חובה'], errors='coerce').fillna(0) - pd.to_numeric(df_raw['זכות'], errors='coerce').fillna(0),
+                            'Memo': df_raw.get('פרטים', '-').fillna('-'),
+                            'MapKey': acc_num
+                        })
+                    else:
+                        f.seek(0) # חזרה לתחילת הקובץ
+                        df_raw = pd.read_excel(f, skiprows=4) if f.name.endswith(('.xlsx', '.xls')) else pd.read_csv(f, skiprows=4)
+                        acc_name = df_raw['Distribution account'].astype(str)
+                        acc_num = acc_name.str.extract('(\d+)', expand=False).fillna(acc_name).str.strip()
+                        df_temp = pd.DataFrame({
+                            'Entity': 'Inc',
+                            'Date': df_raw['Transaction date'].apply(fix_date_swap),
+                            'Vendor': df_raw['Name'].fillna('Unknown'),
+                            'Account': acc_name,
+                            'Amount': pd.to_numeric(df_raw['Amount'].astype(str).str.replace(r'[\$,",]', '', regex=True), errors='coerce'),
+                            'Memo': df_raw['Memo/Description'].fillna('-'),
+                            'MapKey': acc_num
+                        })
+                    all_data.append(df_temp)
+
+                df_final = pd.concat(all_data, ignore_index=True).dropna(subset=['Date'])
+                df_final = pd.merge(df_final, df_mapping, left_on=['Entity', 'MapKey'], right_on=['Entity', 'Number of account-ERP'], how='left')
+                df_final['Budget item'] = df_final['Budget item'].fillna('Other / Unmapped')
+                
+                # יצירת קובץ אקסל להורדה
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                    df_final[['Entity', 'Date', 'Vendor', 'Account', 'Amount', 'Memo', 'Budget item']].to_excel(writer, sheet_name='Data', index=False)
+                    workbook = writer.book
+                    ws = workbook.add_worksheet('Summary')
+                    ws.write('A1', 'הדוח מוכן בגיליון Data')
+                    ws.write('A2', 'סה"כ:')
+                    ws.write_formula('B2', '=SUM(Data!E2:E50000)', workbook.add_format({'num_format': '#,##0.00', 'bold': True}))
+
+                st.success("✅ העיבוד הושלם!")
+                st.download_button(label="📥 הורד דוח אקסל", data=output.getvalue(), file_name="Report.xlsx")
+            except Exception as e:
+                st.error(f"שגיאה: {e}")
